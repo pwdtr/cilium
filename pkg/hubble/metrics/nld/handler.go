@@ -12,6 +12,7 @@ import (
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
 	"github.com/cilium/cilium/pkg/hubble/metrics/api"
+	"github.com/cilium/cilium/pkg/identity"
 )
 
 const (
@@ -25,7 +26,6 @@ const (
 
 type nldHandler struct {
 	includeDirection bool
-	includeNodes     bool
 	ignoreHost       bool
 
 	context *api.ContextOptions
@@ -46,24 +46,18 @@ func (d *nldHandler) Init(registry *prometheus.Registry, options api.Options) er
 		switch strings.ToLower(key) {
 		case "direction":
 			d.includeDirection = true
-		case "nodes":
-			d.includeNodes = true
 		case "ignoreHost":
 			d.ignoreHost = true
 		}
 	}
 
 	contextLabels := d.context.GetLabelNames()
-	var nodeLabel []string
-	if d.includeNodes {
-		nodeLabel = []string{"node"}
-	}
 	var directionLabel []string
 	if d.includeDirection {
 		directionLabel = []string{"direction"}
 	}
 
-	finalLabels := append(append(contextLabels, nodeLabel...), directionLabel...)
+	finalLabels := append(contextLabels, directionLabel...)
 
 	d.downstream = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: api.DefaultPrometheusNamespace,
@@ -94,9 +88,6 @@ func (d *nldHandler) Status() string {
 	if d.includeDirection {
 		status = append(status, "includeDirection")
 	}
-	if d.includeNodes {
-		status = append(status, "includeNodes")
-	}
 	if d.ignoreHost {
 		status = append(status, "ignoreHost")
 	}
@@ -112,15 +103,12 @@ func (d *nldHandler) ListMetricVec() []*prometheus.MetricVec {
 	return []*prometheus.MetricVec{d.upstream.MetricVec, d.downstream.MetricVec, d.bypass.MetricVec}
 }
 
-// Is L4 on port 53 & verdict forwarded
-// Check for host traffic (drop if applicable)
-// Get node name (for labeling)
-// Get direction (for labeling)
-// IS NLD Source
-// IS NLD Dest
-// Increment the right metric
 func (d *nldHandler) ProcessFlow(ctx context.Context, flow *flowpb.Flow) error {
-	if flow.GetVerdict() != flowpb.Verdict_FORWARDED && flow.GetL4() == nil {
+	if flow.GetVerdict() != flowpb.Verdict_FORWARDED || flow.GetL4() == nil {
+		return nil
+	}
+
+	if d.ignoreHost && isHostTraffic(flow) {
 		return nil
 	}
 
@@ -130,18 +118,9 @@ func (d *nldHandler) ProcessFlow(ctx context.Context, flow *flowpb.Flow) error {
 		return nil
 	}
 
-	if d.ignoreHost && isHostTraffic(flow) {
-		return nil
-	}
-
 	contextLabels, err := d.context.GetLabelValues(flow)
 	if err != nil {
 		return err
-	}
-
-	var nodeLabel []string
-	if d.includeNodes {
-		nodeLabel = []string{flow.NodeName}
 	}
 
 	var directionLabel []string
@@ -152,66 +131,52 @@ func (d *nldHandler) ProcessFlow(ctx context.Context, flow *flowpb.Flow) error {
 		directionLabel = []string{responseLabel}
 	}
 
-	finalLabels := append(append(contextLabels, nodeLabel...), directionLabel...)
+	finalLabels := append(contextLabels, directionLabel...)
 
 	srcnld := isNodeLocalDNSPod(flow.Source)
 	dstnld := isNodeLocalDNSPod(flow.Destination)
 
-	if srcnld == false && dstnld == false {
+	switch {
+	case !srcnld && !dstnld:
 		d.bypass.WithLabelValues(finalLabels...).Inc()
-	}
-	if srcnld == true && dstnld == false {
-		if isDNSQuery {
-			d.upstream.WithLabelValues(finalLabels...).Inc()
-		}
-		if isDNSResponse {
-			d.downstream.WithLabelValues(finalLabels...).Inc()
-		}
-	}
-	if srcnld == false && dstnld == true {
-		if isDNSQuery {
-			d.downstream.WithLabelValues(finalLabels...).Inc()
-		}
-		if isDNSResponse {
-			d.upstream.WithLabelValues(finalLabels...).Inc()
-		}
+	case !srcnld && dstnld && isDNSQuery:
+		d.downstream.WithLabelValues(finalLabels...).Inc()
+	case srcnld && !dstnld && isDNSResponse:
+		d.downstream.WithLabelValues(finalLabels...).Inc()
+	case !srcnld && dstnld && isDNSResponse:
+		d.upstream.WithLabelValues(finalLabels...).Inc()
+	case srcnld && !dstnld && isDNSQuery:
+		d.upstream.WithLabelValues(finalLabels...).Inc()
 	}
 
 	return nil
 }
 
 func checkDestinationPort(l4 *flowpb.Layer4) bool {
-	if udp := l4.GetUDP(); udp != nil {
-		if udp.DestinationPort == dnsPort {
-			return true
-		}
+	if l4.GetUDP().GetDestinationPort() == dnsPort {
+		return true
 	}
-	if tcp := l4.GetTCP(); tcp != nil {
-		if tcp.DestinationPort == dnsPort {
-			return true
-		}
+	if l4.GetTCP().GetDestinationPort() == dnsPort {
+		return true
 	}
 	return false
 }
 
 func checkSourcePort(l4 *flowpb.Layer4) bool {
-	if udp := l4.GetUDP(); udp != nil {
-		if udp.SourcePort == dnsPort {
-			return true
-		}
+	if l4.GetUDP().GetSourcePort() == dnsPort {
+		return true
 	}
-	if tcp := l4.GetTCP(); tcp != nil {
-		if tcp.SourcePort == dnsPort {
-			return true
-		}
+	if l4.GetTCP().GetSourcePort() == dnsPort {
+		return true
 	}
 	return false
 }
 
 func isNodeLocalDNSPod(endpoint *flowpb.Endpoint) bool {
-	return endpoint.Namespace == systemNamespace && slices.Contains(endpoint.Labels, nldLabel)
+	return endpoint.GetNamespace() == systemNamespace && slices.Contains(endpoint.Labels, nldLabel)
 }
 
 func isHostTraffic(flow *flowpb.Flow) bool {
-	return slices.Contains(flow.Source.Labels, hostLabel) || slices.Contains(flow.Destination.Labels, hostLabel)
+	return flow.GetSource().GetIdentity() == uint32(identity.ReservedIdentityHost) ||
+		flow.GetDestination().GetIdentity() == uint32(identity.ReservedIdentityHost)
 }

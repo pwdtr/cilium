@@ -15,7 +15,7 @@ func (p *nldPlugin) NewHandler() api.Handler {
 
 func (p *nldPlugin) HelpText() string {
 	return `nodelocaldns related metrics
-Reports metrics related to DNS queries and responses focusing on nodelocaldns,
+Reports metrics related to DNS queries and responses focusing on NodeLocalDNS,
 the caching layer.
 
 Metrics:
@@ -24,7 +24,6 @@ Metrics:
   hubble_nld_bypass_total       Number of observed DNS queries bypassing NLD
 
 Options:
- nodes                  - Include node's name as label
  direction              - Include direction as label
  ignoreHost             - Exclude DNS traffic from the node/host` +
 		api.ContextOptionsHelp
